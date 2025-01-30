@@ -1,0 +1,60 @@
+<div class="analytics-container">
+    <div id="analytics-controls" class="controls-section"></div>
+    
+    <div class="chart-grid">
+        <div class="chart-card">
+            <h2>RPC Performance Analysis</h2>
+            <div class="chart-wrapper">
+                <canvas id="performance-chart"></canvas>
+            </div>
+            <div class="metrics-summary"></div>
+        </div>
+        
+        <div class="chart-card">
+            <h2>ML Prediction Accuracy</h2>
+            <div class="chart-wrapper">
+                <canvas id="predictions-chart"></canvas>
+            </div>
+            <div class="prediction-stats"></div>
+        </div>
+        
+        <div class="chart-card">
+            <h2>Wallet Activity Patterns</h2>
+            <div class="chart-wrapper">
+                <canvas id="wallet-activity-chart"></canvas>
+            </div>
+            <div class="pattern-insights"></div>
+        </div>
+    </div>
+</div>
+
+<!-- Load dependencies in correct order -->
+<script src="/socket.io/socket.io.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script>
+<script src="/js/analytics-charts.js"></script>
+<script src="/js/analytics-controls.js"></script>
+
+<style>
+.chart-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 1rem;
+    padding: 1rem;
+}
+
+.chart-card {
+    background: #1a1a1a;
+    border-radius: 8px;
+    padding: 1rem;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.controls-section {
+    padding: 1rem;
+    margin-bottom: 1rem;
+    background: #2a2a2a;
+    border-radius: 8px;
+}
+</style> 
