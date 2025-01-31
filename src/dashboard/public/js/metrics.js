@@ -1,9 +1,13 @@
 function updateBalanceDisplay(metrics) {
-    const balanceEl = document.getElementById('wallet-balance');
-    if (balanceEl && metrics.balance) {
-        balanceEl.innerHTML = `
-            <div class="balance-sol">${metrics.balance.sol.toFixed(4)} SOL</div>
-            <div class="balance-usd">$${metrics.balance.usd.toFixed(2)}</div>
-        `;
+    // Update Portfolio Value
+    const portfolioValueEl = document.getElementById('portfolio-value');
+    if (portfolioValueEl && metrics.balance) {
+        portfolioValueEl.innerHTML = `$${metrics.balance.usd.toFixed(2)}`;
+    }
+
+    // Update SOL Balance
+    const solBalanceEl = document.getElementById('sol-balance');
+    if (solBalanceEl && metrics.balance) {
+        solBalanceEl.innerHTML = `${metrics.balance.sol.toFixed(4)} SOL`;
     }
 } 

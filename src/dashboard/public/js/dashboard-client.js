@@ -15,6 +15,22 @@ socket.on('metrics-update', (metrics) => {
     updateTransactions(metrics.transactions);
 });
 
+socket.on('metrics', (metrics) => {
+    console.log('Received metrics:', metrics);
+    if (metrics && metrics.balance) {
+        const portfolioValueEl = document.getElementById('portfolio-value');
+        const solBalanceEl = document.getElementById('sol-balance');
+        
+        if (portfolioValueEl) {
+            portfolioValueEl.textContent = `$${metrics.balance.usd.toFixed(2)}`;
+        }
+        
+        if (solBalanceEl) {
+            solBalanceEl.textContent = `${metrics.balance.sol.toFixed(4)} SOL`;
+        }
+    }
+});
+
 // Dark mode handling
 function initializeTheme() {
     const themeToggleDarkIcon = document.getElementById('theme-toggle-dark-icon');
@@ -68,18 +84,6 @@ function updateConnectionStatus(connected) {
         status.className = 'inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100';
         status.textContent = 'Disconnected';
     }
-}
-
-function updatePortfolio(portfolio) {
-    document.getElementById('portfolio-value').textContent = formatCurrency(portfolio.usdValue);
-    document.getElementById('sol-balance').textContent = `${portfolio.sol} SOL`;
-    
-    const changeElement = document.getElementById('change-24h');
-    const change = portfolio.changes['24h'];
-    const isPositive = change >= 0;
-    
-    changeElement.textContent = `${isPositive ? '+' : ''}${change.toFixed(2)}%`;
-    changeElement.className = `mt-1 text-3xl font-semibold ${isPositive ? 'text-emerald-600' : 'text-red-600'}`;
 }
 
 function updateTransactions(transactions) {

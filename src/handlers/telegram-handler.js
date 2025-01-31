@@ -11,6 +11,7 @@ class TelegramHandler {
         this.commandCooldowns = new Map();
         this.COOLDOWN_PERIOD = 5000; // 5 seconds between commands
         this.initializeCommands();
+        this.initializeHandlers();
     }
 
     async handleCommand(chatId, command, handler) {
@@ -82,6 +83,14 @@ class TelegramHandler {
         });
     }
 
+    initializeHandlers() {
+        this.walletTracker.on('walletUpdate', async (update) => {
+            if (update.memecoinTransactions?.length > 0) {
+                await this.sendMemecoinAlert(update);
+            }
+        });
+    }
+
     async sendHelp(chatId) {
         const helpMessage = `
 🤖 Welcome to Wallet Tracker Bot!
@@ -96,8 +105,8 @@ Available Commands:
 
 ⚠️ Alerts will show:
 - Token purchases from tracked wallets
-- Quick buy options
-- Risk analysis
+- Purchase amounts and timing
+- Multiple wallet correlation
 
 Example:
 /addwallet FZLt2wfpE5cxkHkxGwsoPjt4TxAQPzwjBWyuJDVqMKyN
@@ -107,21 +116,25 @@ Example:
 
     async getWalletBalance(chatId) {
         try {
-            const connection = new Connection(process.env.SOLANA_RPC_ENDPOINT);
-            const pubKey = new PublicKey(this.walletAddress);
-            const balance = await connection.getBalance(pubKey);
-            const solBalance = balance / 1e9;
+            if (!this.walletAddress) {
+                await this.bot.sendMessage(chatId, '❌ No wallet address configured');
+                return;
+            }
+
+            const balance = await this.walletTracker.getWalletBalance(this.walletAddress);
             const solPrice = await this.getSolPrice();
+            const solBalance = balance / 1e9; // Convert lamports to SOL
+            const usdBalance = solBalance * solPrice;
 
             const message = `
-💰 Your Wallet Balance:
-SOL: ${solBalance.toFixed(4)} (≈ $${(solBalance * solPrice).toFixed(2)})
-Address: ${this.walletAddress}
-`;
+💰 Wallet Balance:
+${solBalance.toFixed(4)} SOL ($${usdBalance.toFixed(2)} USD)
+🏦 Wallet: ${this.walletAddress.slice(0, 4)}...${this.walletAddress.slice(-4)}`;
+
             await this.bot.sendMessage(chatId, message);
         } catch (error) {
             console.error('Error fetching wallet balance:', error);
-            await this.bot.sendMessage(chatId, 'Error fetching wallet balance');
+            await this.bot.sendMessage(chatId, '❌ Error fetching wallet balance');
         }
     }
 
@@ -156,55 +169,86 @@ Address: ${this.walletAddress}
         }
     }
 
-    async sendWalletAlert(alert) {
-        try {
-            const solPrice = await this.getSolPrice();
-            const totalUsdAmount = alert.totalAmount * solPrice;
-            
+    async sendMemecoinAlert(update) {
+        for (const tx of update.memecoinTransactions) {
+            if (!tx || !tx.tokenAddress) {
+                console.error('Invalid transaction data:', tx);
+                continue;
+            }
+
             const message = `
-🚨 ALPHA: ${alert.buyers.length} wallets bought ${alert.token}! 🚨
+🚨 New Memecoin Purchase Detected! 🚨
 
-🔹 Memecoin: ${alert.token}
-🔹 Contract Address: ${alert.contract.slice(0, 4)}...${alert.contract.slice(-4)}
-💰 Total Volume: ${alert.totalAmount.toFixed(2)} SOL ($${totalUsdAmount.toFixed(2)})
+👛 Wallet: ${tx.wallet.slice(0, 4)}...${tx.wallet.slice(-4)}
+🪙 Token: ${tx.tokenSymbol} (${tx.tokenName})
+💰 Amount: ${tx.amount.toFixed(2)} SOL
+⏰ Time: ${new Date(tx.timestamp).toLocaleString()}
 
-🛒 Wallets Detected:
-${alert.buyers.map((buyer, i) => 
-    `${i+1}️⃣ Wallet: ${buyer.wallet.slice(0, 4)}...${buyer.wallet.slice(-6)} → Amount: ${buyer.amount.toFixed(2)} SOL ($${buyer.usdAmount.toFixed(2)})`
-).join('\n')}
+📊 Links:
+• Token: https://solscan.io/token/${tx.tokenAddress}
+• Chart: https://dexscreener.com/solana/${tx.tokenAddress}
+• Transaction: https://solscan.io/tx/${tx.signature}
 
-⏰ Time Frame: ${alert.timeFrame}
-⚡ Quick Buy Options:`;
+⚠️ DYOR - Not financial advice`;
 
-            const buyButtons = {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: "Buy 0.4 SOL", callback_data: `buy_${alert.token}_0.4` }],
-                        [{ text: "Custom Amount", callback_data: `buy_${alert.token}_custom` }]
-                    ]
-                }
-            };
-
-            await this.bot.sendMessage(this.chatId, message, buyButtons);
-        } catch (error) {
-            console.error('Error sending wallet alert:', error);
-            await this.bot.sendMessage(this.chatId, '❌ Error processing alert');
+            try {
+                await this.bot.sendMessage(this.chatId, message, {
+                    parse_mode: 'HTML',
+                    disable_web_page_preview: true
+                });
+            } catch (error) {
+                console.error('Error sending Telegram alert:', error);
+            }
         }
     }
 
     async sendWelcomeMessage() {
         const message = `
-🤖 Wallet Tracker Bot Started! 🚀
+🤖 Wallet Tracker Bot Started!
 
-Commands:
-/help - Show available commands
-/addwallet <address> - Track a new wallet
-/wallets - List tracked wallets
-/balance - Check wallet balance
-
-Monitoring ${this.walletTracker.trackedWallets.length} wallets for memecoin purchases.
+Monitoring ${this.walletTracker.trackedWallets.length} wallets for memecoin activity.
 `;
         await this.bot.sendMessage(this.chatId, message);
+    }
+
+    async sendTokenAlert(alert) {
+        try {
+            const message = `
+🔔 New Token Detected! 🔔
+
+👛 Wallet: ${alert.wallet.slice(0, 4)}...${alert.wallet.slice(-4)}
+🪙 Token Contract: ${alert.token.contract}
+💰 Amount: ${alert.token.amount.toFixed(2)}
+💵 Est. Value: $${alert.token.usdValue.toFixed(2)}
+
+🔍 Links:
+• Token: ${alert.tokenUrl}
+${alert.url ? `• Transaction: ${alert.url}` : ''}
+
+⚠️ DYOR - Not financial advice`;
+
+            const inlineKeyboard = {
+                inline_keyboard: [
+                    [
+                        { text: '🔍 View Token', url: alert.tokenUrl },
+                        { text: '📊 Chart', url: `https://dexscreener.com/solana/${alert.token.contract}` }
+                    ]
+                ]
+            };
+
+            if (alert.url) {
+                inlineKeyboard.inline_keyboard[0].push(
+                    { text: '🔎 Transaction', url: alert.url }
+                );
+            }
+
+            await this.bot.sendMessage(this.chatId, message, {
+                parse_mode: 'HTML',
+                reply_markup: inlineKeyboard
+            });
+        } catch (error) {
+            console.error('Error sending token alert:', error);
+        }
     }
 }
 

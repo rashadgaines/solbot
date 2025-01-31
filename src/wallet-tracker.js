@@ -2,445 +2,362 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const fs = require('fs');
 const axios = require('axios');
 const EventEmitter = require('events');
+const RateLimiter = require('./utils/RateLimiter');
+const Logger = require('./utils/logger');
+
+class TokenBucket {
+    constructor(capacity, fillPerSecond) {
+        this.capacity = capacity;
+        this.tokens = capacity;
+        this.fillPerSecond = fillPerSecond;
+        this.lastFill = Date.now();
+        
+        // Much more conservative settings
+        this.minWaitTime = 15000;     // 15 seconds base wait
+        this.maxWaitTime = 120000;    // 2 minutes max wait
+        this.backoffMultiplier = 1;
+        this.consecutiveFailures = 0;
+        
+        // Track request history
+        this.requestHistory = new Map(); // wallet -> lastRequestTime
+    }
+
+    async getToken(priority = 'LOW', wallet = null) {
+        this.fillBucket();
+        
+        // Check wallet-specific cooldown
+        if (wallet) {
+            const lastRequest = this.requestHistory.get(wallet) || 0;
+            const timeSinceLastRequest = Date.now() - lastRequest;
+            if (timeSinceLastRequest < this.minWaitTime) {
+                await new Promise(resolve => 
+                    setTimeout(resolve, this.minWaitTime - timeSinceLastRequest)
+                );
+            }
+        }
+
+        // Calculate wait time based on tokens and failures
+        if (this.tokens < 1 || this.consecutiveFailures > 0) {
+            const waitTime = Math.min(
+                this.minWaitTime * Math.pow(2, this.consecutiveFailures),
+                this.maxWaitTime
+            );
+            
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            this.fillBucket();
+        }
+
+        // Update tracking
+        if (wallet) {
+            this.requestHistory.set(wallet, Date.now());
+        }
+        
+        this.tokens = Math.max(0, this.tokens - 1);
+        return true;
+    }
+
+    recordSuccess() {
+        this.consecutiveFailures = Math.max(0, this.consecutiveFailures - 1);
+        this.backoffMultiplier = Math.max(1, this.backoffMultiplier * 0.5);
+    }
+
+    recordFailure() {
+        this.consecutiveFailures++;
+        this.tokens = 0; // Reset tokens on failure
+    }
+
+    fillBucket() {
+        const now = Date.now();
+        const timePassed = (now - this.lastFill) / 1000;
+        this.lastFill = now;
+        
+        this.tokens = Math.min(
+            this.capacity,
+            this.tokens + timePassed * this.fillPerSecond
+        );
+    }
+}
 
 class WalletTracker extends EventEmitter {
     constructor(connection, config, bot) {
         super();
         this.connection = connection;
         this.config = config;
-        this.bot = bot;  // Store bot reference
+        this.bot = bot;
         this.trackedWallets = this.loadTrackedWallets();
-        this.recentTransactions = new Map();
         
-        // Updated queue handling
-        this.highPriorityQueue = [];
-        this.normalPriorityQueue = [];
-        this.isProcessing = false;
+        // More conservative rate limiting
+        this.rateLimiter = new RateLimiter({
+            maxTokens: 15,  // Reduced from 25
+            refillRate: 1   // Reduced from 2
+        });
         
-        // Cache settings
-        this.cache = {
-            walletBalances: new Map(),
-            transactions: new Map(),
-            signatures: new Map()
+        // Increased cache TTL
+        this.transactionCache = new Map();
+        this.CACHE_TTL = 60000; // Increased to 60 seconds
+        
+        // Increased monitoring intervals
+        this.PRIORITY_LEVELS = {
+            HIGH: 15000,    // 15 seconds
+            MEDIUM: 45000,  // 45 seconds
+            LOW: 90000      // 90 seconds
         };
-        this.BALANCE_CACHE_TTL = 30000;    // 30 seconds
-        this.TRANSACTION_CACHE_TTL = 60000; // 1 minute
-        this.SIGNATURE_CACHE_TTL = 30000;   // 30 seconds
         
-        // Existing price cache
-        this.lastPriceCheck = 0;
-        this.cachedSolPrice = null;
-        this.PRICE_CACHE_DURATION = 60000;
+        this.sentAlerts = new Map();
+        this.startMonitoring();
+    }
+
+    async startMonitoring() {
+        Logger.info('Starting wallet monitoring...');
+        Logger.info(`Tracking ${this.trackedWallets.length} wallets`);
         
-        // Rate limiting settings
-        this.requestsPerInterval = 10;
-        this.intervalMs = 1000;
-        this.requestQueue = [];
-        this.lastRequestTime = Date.now();
+        let processedTransactions = 0;
+        let lastStatusUpdate = Date.now();
         
-        // Track memecoin purchases
-        this.recentPurchases = new Map();
-        this.purchaseAlerts = [];
+        while (true) {
+            try {
+                await this.processWallets();
+                processedTransactions++;
+                
+                // Log status every minute
+                if (Date.now() - lastStatusUpdate > 60000) {
+                    Logger.info(`Status Update:
+• Processed ${processedTransactions} wallet checks
+• Current rate limits: ${this.rateLimiter.tokens.toFixed(2)} tokens
+• Active wallets: ${this.trackedWallets.length}
+`);
+                    lastStatusUpdate = Date.now();
+                    processedTransactions = 0;
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            } catch (error) {
+                Logger.error(`Monitoring error: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, 10000));
+            }
+        }
+    }
+
+    async processWallets() {
+        const wallets = this.trackedWallets;
+        for (const wallet of wallets) {
+            try {
+                await this.rateLimiter.getToken();
+                const updates = await this.checkWalletActivity(wallet);
+                
+                if (updates.hasActivity) {
+                    this.emit('walletUpdate', {
+                        wallet,
+                        ...updates,
+                        timestamp: Date.now()
+                    });
+                }
+            } catch (error) {
+                if (error.message.includes('429')) {
+                    this.rateLimiter.recordFailure();
+                    await this.bot.rotateConnection();
+                    continue;
+                }
+                console.error(`Error processing wallet ${wallet}:`, error);
+            }
+        }
+    }
+
+    async checkWalletActivity(wallet) {
+        const [tokenAccounts, signatures] = await Promise.all([
+            this.getWalletTokenAccounts(wallet),
+            this.getRecentSignatures(wallet)
+        ]);
+
+        const transactions = await this.processTransactions(signatures);
+        // Wait for all promises to resolve
+        const memecoinTxs = await Promise.all(
+            transactions
+                .map(tx => this.extractMemecoinTransaction(tx, wallet))
+                .filter(tx => tx !== null)
+        );
+
+        return {
+            hasActivity: memecoinTxs.length > 0,
+            memecoinTransactions: memecoinTxs.filter(tx => tx !== null) // Additional null check
+        };
+    }
+
+    async getRecentSignatures(wallet) {
+        await this.rateLimiter.getToken();
         
-        // Add monitoring state
-        this.lastWalletCheck = new Map();
-        this.WALLET_CHECK_INTERVAL = 30000; // 30 seconds minimum between checks
-        this.walletPriorities = new Map();
+        // Get current timestamp and calculate cutoff (30 minutes ago)
+        const currentTime = Math.floor(Date.now() / 1000);
+        const cutoffTime = currentTime - (30 * 60);
         
-        // New request timestamps
-        this.requestTimestamps = [];
+        const signatures = await this.connection.getSignaturesForAddress(
+            new PublicKey(wallet),
+            { limit: 10 },
+            'confirmed'
+        );
+        
+        // Filter out old transactions
+        return signatures.filter(sig => sig.blockTime && sig.blockTime > cutoffTime);
+    }
+
+    async processTransactions(signatures) {
+        const transactions = [];
+        
+        if (signatures.length > 0) {
+            Logger.info(`Processing ${signatures.length} new transactions...`);
+        }
+        
+        for (const sig of signatures) {
+            try {
+                await this.rateLimiter.getToken();
+                const tx = await this.connection.getParsedTransaction(
+                    sig.signature,
+                    {
+                        maxSupportedTransactionVersion: 0,
+                        commitment: 'confirmed'
+                    }
+                );
+                
+                if (tx && tx.transaction) {
+                    const memecoinTx = await this.extractMemecoinTransaction(tx, sig.wallet);
+                    if (memecoinTx) {
+                        Logger.success(`Found new memecoin transaction: ${sig.signature}`);
+                        transactions.push(memecoinTx);
+                    }
+                }
+            } catch (error) {
+                if (error.message.includes('429')) {
+                    Logger.warning('Rate limit hit, cooling down...');
+                    await new Promise(resolve => setTimeout(resolve, 5000));
+                    continue;
+                }
+                Logger.error(`Error fetching transaction ${sig.signature}: ${error.message}`);
+            }
+        }
+        
+        return transactions;
+    }
+
+    async extractMemecoinTransaction(tx, wallet) {
+        try {
+            // Validate transaction structure
+            if (!tx?.transaction?.message?.instructions) {
+                return null;
+            }
+
+            const tokenProgramIdx = tx.transaction.message.instructions.findIndex(
+                ix => ix.programId?.toString() === 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+            );
+
+            if (tokenProgramIdx === -1) return null;
+
+            const instruction = tx.transaction.message.instructions[tokenProgramIdx];
+            
+            // Validate instruction data
+            if (!instruction?.parsed?.info?.mint) {
+                return null;
+            }
+
+            // Check if we've already alerted about this transaction
+            const txSignature = tx.transaction.signatures[0];
+            if (this.sentAlerts.has(txSignature)) {
+                return null;
+            }
+
+            // Mark this transaction as processed
+            this.sentAlerts.set(txSignature, Date.now());
+
+            return {
+                wallet,
+                tokenAddress: instruction.parsed.info.mint,
+                amount: instruction.parsed.info.amount / 1e9,
+                timestamp: tx.blockTime * 1000,
+                signature: txSignature
+            };
+        } catch (error) {
+            console.error('Error extracting memecoin transaction:', error);
+            return null;
+        }
+    }
+
+    async getWalletTokenAccounts(wallet) {
+        await this.rateLimiter.getToken();
+        const accounts = await this.connection.getParsedTokenAccountsByOwner(
+            new PublicKey(wallet),
+            { programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA') }
+        );
+        return accounts.value;
     }
 
     loadTrackedWallets() {
-        const data = fs.readFileSync('./tracked-wallets.json');
-        return JSON.parse(data).wallets;
-    }
-
-    async trackWalletTransactions() {
-        const now = Date.now();
-        const eligibleWallets = this.trackedWallets.filter(wallet => {
-            const lastCheck = this.lastWalletCheck.get(wallet) || 0;
-            return (now - lastCheck) >= this.WALLET_CHECK_INTERVAL;
-        });
-
-        if (eligibleWallets.length === 0) return null;
-
-        const batchSize = 2; // Reduced from 5 to 2
-        const walletBatches = this.chunkArray(eligibleWallets, batchSize);
-
-        for (const batch of walletBatches) {
-            try {
-                const promises = batch.map(wallet => this.processWalletTransactions(wallet));
-                const results = await Promise.all(promises);
-                
-                // Update last check time for processed wallets
-                batch.forEach(wallet => {
-                    this.lastWalletCheck.set(wallet, now);
-                });
-
-                // Add delay between batches
-                if (walletBatches.length > 1) {
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                }
-
-                const validResults = results.filter(r => r && r.length > 0);
-                if (validResults.length > 0) {
-                    return validResults.flat();
-                }
-            } catch (error) {
-                console.error('Error processing wallet batch:', error);
-                await new Promise(resolve => setTimeout(resolve, 5000)); // Longer delay on error
-            }
-        }
-        return null;
-    }
-
-    async rateLimit() {
-        const now = Date.now();
-        const timeSinceLastRequest = now - this.lastRequestTime;
-        const baseDelay = 2000; // Increase base delay to 2 seconds
-        const jitter = Math.random() * 500; // Add randomization
-        
-        if (timeSinceLastRequest < this.intervalMs) {
-            await new Promise(resolve => 
-                setTimeout(resolve, baseDelay + jitter)
-            );
-        }
-        
-        // Track request timestamps for rolling window
-        this.requestTimestamps = this.requestTimestamps.filter(t => now - t < 60000);
-        this.requestTimestamps.push(now);
-        
-        // If we're approaching rate limit, add extra delay
-        if (this.requestTimestamps.length > 45) { // 75% of 60 requests/minute
-            await new Promise(resolve => 
-                setTimeout(resolve, 5000 + jitter)
-            );
-        }
-        
-        this.lastRequestTime = Date.now();
-    }
-
-    async processWalletTransactions(wallet) {
-        const endpoint = this.bot.config.rpc.endpoints[this.bot.currentRpcIndex];
         try {
-            console.log(`Processing wallet ${wallet.slice(0, 4)}...${wallet.slice(-4)} using endpoint: ${endpoint}`);
-            
-            const signatures = await this.bot.queueRequest(
-                async () => this.getTransactionSignatures(wallet),
-                true
-            );
-
-            if (!signatures || signatures.length === 0) {
-                console.log(`No signatures found for wallet ${wallet}`);
-                return [];
-            }
-
-            const transactions = await Promise.all(
-                signatures.map(sig => 
-                    this.bot.queueRequest(
-                        async () => {
-                            try {
-                                const tx = await this.connection.getParsedTransaction(sig.signature);
-                                return tx || null;
-                            } catch (error) {
-                                console.error(`Error fetching transaction ${sig.signature}:`, error);
-                                return null;
-                            }
-                        },
-                        false
-                    )
-                )
-            );
-
-            const validTransactions = transactions.filter(tx => tx !== null);
-            const memecoinPurchases = validTransactions
-                .map(tx => this.extractMemecoinPurchase(tx))
-                .filter(purchase => purchase !== null);
-
-            if (memecoinPurchases.length > 0) {
-                await this.processPurchaseAlerts(wallet, memecoinPurchases);
-            }
-
-            return memecoinPurchases;
+            const data = fs.readFileSync('./tracked-wallets.json');
+            return JSON.parse(data).wallets;
         } catch (error) {
-            console.error(`Error processing wallet ${wallet} on endpoint ${endpoint}:`, error.message);
-            this.bot.recordFailure(endpoint);
+            console.error('Error loading wallets:', error);
             return [];
         }
     }
+}
 
-    async processPurchaseAlerts(wallet, purchases) {
-        for (const purchase of purchases) {
-            const tokenAddress = purchase.tokenAddress;
-            
-            // Track which wallets bought this token
-            if (!this.recentPurchases.has(tokenAddress)) {
-                this.recentPurchases.set(tokenAddress, new Set());
-            }
-            this.recentPurchases.get(tokenAddress).add(wallet);
-            
-            // Check if multiple wallets bought the same token
-            const buyerCount = this.recentPurchases.get(tokenAddress).size;
-            const priority = buyerCount >= this.config.alerts.priorityThreshold ? 'HIGH' : 'MEDIUM';
-            
-            this.emit('purchase', {
-                wallet,
-                purchase,
-                priority,
-                buyerCount
-            });
-        }
-    }
-
-    chunkArray(array, size) {
-        const chunks = [];
-        for (let i = 0; i < array.length; i += size) {
-            chunks.push(array.slice(i, i + size));
-        }
-        return chunks;
-    }
-
-    async processTokenPurchase(wallet, purchase) {
-        // Validate purchase amount
-        if (!this.isValidPurchaseAmount(purchase.amount)) {
-            console.log(`Skipping small transaction: ${purchase.amount} SOL`);
-            return null;
-        }
-
-        const timeWindow = 90 * 60 * 1000; // 90 minutes
-        const now = Date.now();
-        
-        // Clean old transactions
-        for (const [key, tx] of this.recentTransactions) {
-            if (now - tx.timestamp > timeWindow) {
-                this.recentTransactions.delete(key);
-            }
-        }
-
-        // Get SOL price for USD conversion
-        const solPrice = await this.getSolPrice();
-
-        // Add new transaction with SOL amount
-        const txKey = `${purchase.tokenAddress}-${now}`;
-        this.recentTransactions.set(txKey, {
-            wallet,
-            ...purchase,
-            solAmount: purchase.amount,
-            usdAmount: purchase.amount * solPrice,
-            timestamp: now
-        });
-
-        // Check for related purchases
-        const relatedPurchases = this.findRelatedPurchases(purchase.tokenAddress, timeWindow);
-        
-        // Format buyers with amounts
-        const buyers = relatedPurchases.map(tx => ({
-            wallet: tx.wallet,
-            amount: tx.solAmount,
-            usdAmount: tx.usdAmount
-        }));
-
-        return {
-            priority: relatedPurchases.length >= 2 ? 'HIGH' : 'MEDIUM',
-            token: purchase.tokenSymbol,
-            contract: purchase.tokenAddress,
-            buyers,
-            totalAmount: buyers.reduce((sum, b) => sum + b.amount, 0),
-            timeFrame: `${Math.round((now - relatedPurchases[0].timestamp)/60000)}m ago`
+class DataCache {
+    constructor(ttl = 30000) {
+        this.cache = new Map();
+        this.ttl = ttl;
+        this.stats = {
+            hits: 0,
+            misses: 0,
+            evictions: 0
         };
     }
 
-    extractTokenPurchase(tx) {
-        if (!tx?.meta?.postTokenBalances?.length) return null;
-        
-        // Extract token purchase details from transaction
-        try {
-            const tokenBalance = tx.meta.postTokenBalances[0];
-            return {
-                tokenAddress: tokenBalance.mint,
-                tokenSymbol: this.getTokenSymbol(tokenBalance.mint),
-                amount: tokenBalance.uiTokenAmount.uiAmount,
-                timestamp: tx.blockTime * 1000
-            };
-        } catch (error) {
-            console.error('Error extracting token purchase:', error);
+    get(key) {
+        const entry = this.cache.get(key);
+        if (!entry) {
+            this.stats.misses++;
             return null;
         }
-    }
 
-    findRelatedPurchases(tokenAddress, timeWindow) {
-        const now = Date.now();
-        return Array.from(this.recentTransactions.values())
-            .filter(tx => 
-                tx.tokenAddress === tokenAddress && 
-                now - tx.timestamp <= timeWindow
-            );
-    }
-
-    async addWallet(wallet) {
-        if (!this.isValidWallet(wallet)) {
-            throw new Error('Invalid wallet address');
-        }
-        
-        const wallets = this.loadTrackedWallets();
-        if (!wallets.includes(wallet)) {
-            wallets.push(wallet);
-            await this.saveWallets(wallets);
-            this.trackedWallets = wallets;
-        }
-    }
-
-    async removeWallet(wallet) {
-        const wallets = this.loadTrackedWallets()
-            .filter(w => w !== wallet);
-        await this.saveWallets(wallets);
-        this.trackedWallets = wallets;
-    }
-
-    isValidWallet(address) {
-        try {
-            new PublicKey(address);
-            return true;
-        } catch {
-            return false;
-        }
-    }
-
-    async saveWallets(wallets) {
-        await fs.promises.writeFile(
-            './tracked-wallets.json',
-            JSON.stringify({ wallets }, null, 2)
-        );
-    }
-
-    async getSolPrice() {
-        const now = Date.now();
-        
-        // Return cached price if within cache duration
-        if (this.cachedSolPrice && (now - this.lastPriceCheck) < this.PRICE_CACHE_DURATION) {
-            return this.cachedSolPrice;
+        if (Date.now() - entry.timestamp > this.ttl) {
+            this.cache.delete(key);
+            this.stats.evictions++;
+            return null;
         }
 
-        try {
-            // Try CoinGecko first
-            const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-            if (response.data?.solana?.usd) {
-                this.cachedSolPrice = response.data.solana.usd;
-                this.lastPriceCheck = now;
-                return this.cachedSolPrice;
-            }
-
-            // Fallback to Jupiter price API
-            const jupiterResponse = await axios.get(`https://price.jup.ag/v4/price?ids=SOL`);
-            if (jupiterResponse.data?.data?.SOL?.price) {
-                this.cachedSolPrice = jupiterResponse.data.data.SOL.price;
-                this.lastPriceCheck = now;
-                return this.cachedSolPrice;
-            }
-
-            throw new Error('Failed to fetch SOL price from all sources');
-        } catch (error) {
-            console.error('Error fetching SOL price:', error);
-            return this.cachedSolPrice || 0; // Return last known price or 0
-        }
+        this.stats.hits++;
+        return entry.data;
     }
 
-    isValidPurchaseAmount(amount) {
-        const MIN_SOL_AMOUNT = 0.1; // Minimum 0.1 SOL
-        const MAX_SOL_AMOUNT = 10000; // Maximum 10,000 SOL
-        
-        return amount >= MIN_SOL_AMOUNT && 
-               amount <= MAX_SOL_AMOUNT && 
-               !isNaN(amount);
-    }
-
-    async queueTransaction(wallet, transaction) {
-        this.processingQueue.push({ wallet, transaction });
-        if (!this.isProcessing) {
-            await this.processQueue();
-        }
-    }
-
-    async processQueue() {
-        if (this.processingQueue.length === 0) {
-            this.isProcessing = false;
-            return;
-        }
-
-        this.isProcessing = true;
-        const batch = this.processingQueue.splice(0, 10); // Process 10 at a time
-        
-        try {
-            const results = await Promise.all(
-                batch.map(({ wallet, transaction }) => 
-                    this.processTokenPurchase(wallet, transaction)
-                )
-            );
-            
-            // Filter out null results and emit alerts
-            const alerts = results.filter(r => r !== null);
-            if (alerts.length > 0) {
-                this.emit('alerts', alerts);
-            }
-        } catch (error) {
-            console.error('Error processing transaction batch:', error);
-        }
-
-        // Process next batch
-        await this.processQueue();
-    }
-
-    async getWalletBalance(address) {
-        const cached = this.cache.walletBalances.get(address);
-        if (cached && Date.now() - cached.timestamp < this.BALANCE_CACHE_TTL) {
-            return cached.value;
-        }
-
-        const balance = await this.connection.getBalance(new PublicKey(address));
-        this.cache.walletBalances.set(address, {
-            value: balance,
+    set(key, data) {
+        this.cache.set(key, {
+            data,
             timestamp: Date.now()
         });
-        return balance;
+    }
+}
+
+class RequestCache {
+    constructor(ttl = 30000) {
+        this.cache = new Map();
+        this.ttl = ttl;
+        this.metrics = {
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+            totalLatency: 0
+        };
     }
 
-    async getTransactionSignatures(wallet) {
-        const cacheKey = `${wallet}-signatures`;
-        const cached = this.cache.signatures.get(cacheKey);
-        
-        if (cached && Date.now() - cached.timestamp < this.SIGNATURE_CACHE_TTL) {
-            return cached.value;
-        }
+    async getOrFetch(key, fetchFn) {
+        const cached = this.get(key);
+        if (cached) return cached;
 
-        try {
-            const signatures = await this.connection.getSignaturesForAddress(
-                new PublicKey(wallet),
-                { limit: 20 }
-            );
+        const startTime = Date.now();
+        const data = await fetchFn();
+        const latency = Date.now() - startTime;
 
-            // Validate and format the response
-            if (!signatures || !Array.isArray(signatures)) {
-                console.warn(`Invalid signature response for wallet ${wallet}`);
-                return [];
-            }
-
-            const formattedSignatures = signatures.map(sig => ({
-                signature: sig.signature,
-                slot: sig.slot,
-                blockTime: sig.blockTime
-            }));
-
-            this.cache.signatures.set(cacheKey, {
-                value: formattedSignatures,
-                timestamp: Date.now()
-            });
-
-            return formattedSignatures;
-        } catch (error) {
-            console.error(`Error fetching signatures for wallet ${wallet}:`, error);
-            return [];
-        }
+        this.set(key, data, latency);
+        return data;
     }
 }
 

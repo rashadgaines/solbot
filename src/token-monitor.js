@@ -4,26 +4,34 @@ const Dashboard = require('./dashboard/dashboard');
 const EmergencyHandler = require('./handlers/emergency-handler');
 const TelegramHandler = require('./handlers/telegram-handler');
 const WalletTracker = require('./wallet-tracker');
-const WalletBehaviorAnalyzer = require('./analysis/wallet-behavior-analyzer');
 const EndpointPredictor = require('./ml/EndpointPredictor');
+const Logger = require('./utils/logger');
 
 class TokenMonitor {
     constructor(config) {
         this.config = config;
+        Logger.info('Initializing Token Monitor...');
+        
         this.currentRpcIndex = 0;
         this.connection = this.createConnection();
+        Logger.success(`Connected to RPC: ${this.config.rpc.endpoints[0]}`);
         
-        // Initialize components with 'this' as the bot reference
+        this.walletAddress = process.env.WALLET_ADDRESS;
+        Logger.info(`Main wallet address: ${this.walletAddress}`);
+        
+        // Initialize components
+        Logger.info('Initializing components...');
         this.walletTracker = new WalletTracker(this.connection, config.monitoring, this);
         this.telegramHandler = new TelegramHandler(
             new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true }),
             process.env.TELEGRAM_CHAT_ID,
-            process.env.WALLET_ADDRESS,
+            this.walletAddress,
             this.walletTracker
         );
         
         this.dashboard = this.initializeDashboard();
         this.initializeErrorHandler();
+        Logger.success('All components initialized successfully');
         
         // Send welcome message
         if (process.env.TELEGRAM_CHAT_ID) {
@@ -52,32 +60,7 @@ class TokenMonitor {
             consecutiveFailures: 2
         };
 
-        this.adaptiveThresholds = {
-            baselineWindow: 3600000, // 1 hour
-            adjustmentFactor: 0.1,   // 10% adjustment
-            minThresholds: {
-                rateLimitHits: 2,
-                failureRate: 0.1,
-                latencyMs: 500,
-                consecutiveFailures: 2
-            }
-        };
-
-        this.walletBehaviorAnalyzer = new WalletBehaviorAnalyzer();
-        this.walletActivityMetrics = new Map();
-        this.ACTIVITY_WEIGHTS = {
-            transaction: 1.0,
-            memecoinPurchase: 2.0,
-            highValueTrade: 1.5,
-            relatedPurchase: 2.5
-        };
-
         this.endpointPredictor = new EndpointPredictor();
-        
-        // Train model periodically
-        setInterval(() => this.trainPredictionModel(), 3600000); // Every hour
-        setInterval(() => this.adjustThresholds(), 300000); // Every 5 minutes
-        setInterval(() => this.walletBehaviorAnalyzer.processPatterns(), 600000); // Every 10 minutes
     }
 
     validateEndpoint(endpoint) {
@@ -105,43 +88,61 @@ class TokenMonitor {
     }
 
     createConnection() {
-        const endpoint = this.config.rpc.endpoints[this.currentRpcIndex];
-        
-        if (!endpoint || !this.validateEndpoint(endpoint)) {
-            throw new Error('No valid RPC endpoint provided');
-        }
-        
-        return new Connection(endpoint, {
+        const endpoints = this.config.rpc.endpoints;
+        const connections = endpoints.map(endpoint => new Connection(endpoint, {
             commitment: 'confirmed',
-            confirmTransactionInitialTimeout: 60000,
-            maxSupportedTransactionVersion: 0
-        });
+            httpHeaders: this.config.rpc.headers || {},
+            wsEndpoint: endpoint.replace('https', 'wss'),
+            useRequestQueue: true,
+            requestTimeout: 30000
+        }));
+        
+        this.connections = connections;
+        this.currentConnectionIndex = 0;
+        return connections[0];
     }
 
-    async rotateEndpoint() {
-        const previousEndpoint = this.config.rpc.endpoints[this.currentRpcIndex];
-        let attempts = 0;
-        const maxAttempts = this.config.rpc.endpoints.length;
-
-        while (attempts < maxAttempts) {
-            this.currentRpcIndex = (this.currentRpcIndex + 1) % this.config.rpc.endpoints.length;
-            const newEndpoint = this.config.rpc.endpoints[this.currentRpcIndex];
-            
-            if (this.isEndpointHealthy(newEndpoint) && !this.isEndpointCooling(newEndpoint)) {
-                this.connection = this.createConnection();
-                console.log(`Switched from ${previousEndpoint} to ${newEndpoint}`);
-                
-                // Update connection in components
-                if (this.walletTracker) {
-                    this.walletTracker.connection = this.connection;
-                }
-                return true;
-            }
-            attempts++;
-        }
+    async rotateConnection() {
+        const currentEndpoint = this.config.rpc.endpoints[this.currentRpcIndex];
+        this.setCooldown(currentEndpoint);
         
-        console.error('No healthy endpoints available for rotation');
-        return false;
+        // Find next healthy endpoint
+        const healthyEndpoints = this.config.rpc.endpoints.filter(endpoint => 
+            !this.isEndpointCooling(endpoint) && 
+            this.getEndpointHealth(endpoint) > 0.7
+        );
+
+        if (healthyEndpoints.length === 0) {
+            console.log('No healthy endpoints available, enforcing cooldown period...');
+            await new Promise(resolve => setTimeout(resolve, 30000)); // 30s cooldown
+            return this.rotateConnection();
+        }
+
+        // Sort by health score and pick the best one
+        const nextEndpoint = healthyEndpoints.sort((a, b) => 
+            this.getEndpointHealth(b) - this.getEndpointHealth(a)
+        )[0];
+
+        this.currentRpcIndex = this.config.rpc.endpoints.indexOf(nextEndpoint);
+        this.connection = new Connection(nextEndpoint, {
+            commitment: 'confirmed',
+            httpHeaders: this.config.rpc.headers || {},
+            wsEndpoint: nextEndpoint.replace('https', 'wss')
+        });
+
+        await new Promise(resolve => setTimeout(resolve, 5000)); // 5s settling time
+        console.log(`Rotated to endpoint ${this.currentRpcIndex + 1}/${this.config.rpc.endpoints.length}`);
+    }
+
+    getEndpointHealth(endpoint) {
+        const metrics = this.endpointMetrics.get(endpoint);
+        if (!metrics) return 0;
+
+        const rateLimitScore = Math.max(0, 1 - (metrics.rateLimitHits / 10));
+        const successScore = metrics.successCount / (metrics.successCount + metrics.failureCount);
+        const latencyScore = Math.max(0, 1 - (metrics.averageLatency / 1000));
+
+        return (rateLimitScore * 0.4) + (successScore * 0.4) + (latencyScore * 0.2);
     }
 
     isEndpointCooling(endpoint) {
@@ -158,19 +159,10 @@ class TokenMonitor {
         const currentEndpoint = this.config.rpc.endpoints[this.currentRpcIndex];
         
         if (error.message.includes('429') || error.message.includes('Too many requests')) {
+            console.log(`Rate limit hit on ${currentEndpoint}, cooling down...`);
             this.setCooldown(currentEndpoint);
-            this.rotateEndpoint();
-            
-            // Add immediate retry with new endpoint
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            return true;
-        }
-        
-        // Add general error handling
-        if (error.message.includes('timeout') || error.message.includes('network error')) {
-            this.recordFailure(currentEndpoint);
-            this.rotateEndpoint();
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            await this.rotateConnection();
+            await new Promise(resolve => setTimeout(resolve, 5000));
             return true;
         }
         
@@ -194,18 +186,48 @@ class TokenMonitor {
         this.errorHandler = new EmergencyHandler(this.config.alerts);
     }
 
+    chunkArray(array, size) {
+        const chunks = [];
+        for (let i = 0; i < array.length; i += size) {
+            chunks.push(array.slice(i, i + size));
+        }
+        return chunks;
+    }
+
     async startMonitoring() {
-        setInterval(async () => {
+        const wallets = this.walletTracker.trackedWallets;
+        const walletGroups = this.chunkArray(wallets, 5);
+        
+        for (const group of walletGroups) {
             try {
-                const alerts = await this.walletTracker.trackWalletTransactions();
-                if (alerts) {
-                    await this.telegramHandler.sendWalletAlert(alerts);
-                    this.dashboard.updateMetrics();
-                }
+                await this.walletTracker.processWallets();
+                
+                const delay = this.calculateAdaptiveDelay();
+                await new Promise(resolve => setTimeout(resolve, delay));
+                
             } catch (error) {
-                this.errorHandler.handleError(error, 'monitoring');
+                console.error('Error processing wallet group:', error);
+                await new Promise(resolve => setTimeout(resolve, 10000));
             }
-        }, this.config.monitoring.walletTrackingInterval);
+        }
+    }
+
+    async adjustWalletPriorities() {
+        const activityScores = new Map();
+        
+        for (const wallet of this.walletTracker.trackedWallets) {
+            const recentActivity = await this.getWalletActivityScore(wallet);
+            activityScores.set(wallet, recentActivity);
+            
+            // Adjust priority based on activity
+            if (recentActivity > 0.8) {
+                this.walletTracker.walletPriorities.set(wallet, 'HIGH');
+            } else if (recentActivity > 0.4) {
+                this.walletTracker.walletPriorities.set(wallet, 'MEDIUM');
+            } else {
+                this.walletTracker.walletPriorities.set(wallet, 'LOW');
+            }
+        }
     }
 
     isCircuitOpen(endpoint) {
@@ -247,91 +269,84 @@ class TokenMonitor {
         throw new Error('All fallback attempts failed');
     }
 
-    async executeWithCircuitBreaker(operation, attemptCount = 0) {
-        const MAX_ATTEMPTS = this.config.rpc.endpoints.length * 2; // Allow more retries
-        const BACKOFF_TIME = Math.min(1000 * Math.pow(2, attemptCount), 32000);
-        
-        if (attemptCount >= MAX_ATTEMPTS) {
-            await new Promise(resolve => setTimeout(resolve, 30000)); // Cool down period
-            return this.executeFallbackStrategy(operation);
-        }
-
+    async executeWithCircuitBreaker(operation) {
         const endpoint = this.config.rpc.endpoints[this.currentRpcIndex];
-        
-        if (this.isCircuitOpen(endpoint)) {
-            this.rotateEndpoint();
-            await new Promise(resolve => setTimeout(resolve, BACKOFF_TIME));
-            return this.executeWithCircuitBreaker(operation, attemptCount + 1);
-        }
+        const metrics = this.endpointMetrics.get(endpoint);
+        const startTime = Date.now();
 
         try {
             const result = await operation(this.connection);
-            this.resetFailures(endpoint);
+            
+            // Update success metrics
+            metrics.successCount++;
+            metrics.consecutiveFailures = 0;
+            metrics.averageLatency = (metrics.averageLatency + (Date.now() - startTime)) / 2;
+            metrics.lastMinuteRequests.push(Date.now());
+            
+            // Clean up old requests
+            metrics.lastMinuteRequests = metrics.lastMinuteRequests.filter(
+                time => Date.now() - time < 60000
+            );
+            metrics.requestsPerMinute = metrics.lastMinuteRequests.length;
+            
             return result;
         } catch (error) {
-            this.recordFailure(endpoint);
+            // Update failure metrics
+            metrics.failureCount++;
+            metrics.consecutiveFailures++;
+            
             if (error.message.includes('429')) {
-                await new Promise(resolve => setTimeout(resolve, BACKOFF_TIME));
-                this.rotateEndpoint();
-                return this.executeWithCircuitBreaker(operation, attemptCount + 1);
+                metrics.rateLimitHits++;
+                metrics.lastRateLimitHit = Date.now();
             }
+            
             throw error;
         }
     }
 
     initializeEndpointMetrics() {
+        this.endpointMetrics = new Map();
+        
         this.config.rpc.endpoints.forEach(endpoint => {
             this.endpointMetrics.set(endpoint, {
                 successCount: 0,
                 failureCount: 0,
+                latency: [],
+                lastUsed: Date.now(),
                 rateLimitHits: 0,
-                averageLatency: 0,
-                lastHealthCheck: Date.now(),
-                isHealthy: true,
-                consecutiveFailures: 0,
-                requestsPerMinute: 0,
-                lastMinuteRequests: [],
-                errorTypes: new Map(),
+                lastError: null,
                 performance: {
-                    last1m: [],
-                    last5m: [],
-                    last15m: []
+                    success: 0,
+                    total: 0,
+                    avgLatency: 0
                 }
             });
         });
-        
-        // Update metrics every minute
-        setInterval(() => this.updateEndpointMetrics(), 60000);
     }
 
-    async updateEndpointMetrics() {
-        const now = Date.now();
-        
-        this.endpointMetrics.forEach((metrics, endpoint) => {
-            // Calculate requests per minute
-            metrics.lastMinuteRequests = metrics.lastMinuteRequests.filter(
-                time => now - time < 60000
-            );
-            metrics.requestsPerMinute = metrics.lastMinuteRequests.length;
+    updateEndpointMetrics() {
+        if (!this.endpointMetrics) {
+            this.initializeEndpointMetrics();
+            return;
+        }
 
-            // Update moving averages
-            metrics.performance.last1m.push(metrics.averageLatency);
-            metrics.performance.last5m.push(metrics.averageLatency);
-            metrics.performance.last15m.push(metrics.averageLatency);
+        const metrics = {};
+        this.endpointMetrics.forEach((value, endpoint) => {
+            const successRate = value.total === 0 ? 0 : value.success / value.total;
+            const avgLatency = value.latency.length > 0 
+                ? value.latency.reduce((a, b) => a + b, 0) / value.latency.length 
+                : 0;
 
-            // Keep only needed history
-            metrics.performance.last1m = metrics.performance.last1m.slice(-60);
-            metrics.performance.last5m = metrics.performance.last5m.slice(-300);
-            metrics.performance.last15m = metrics.performance.last15m.slice(-900);
-
-            console.log(`Endpoint ${endpoint} metrics:`, {
-                successRate: (metrics.successCount / (metrics.successCount + metrics.failureCount)) * 100,
-                avgLatency: metrics.averageLatency,
-                requestsPerMinute: metrics.requestsPerMinute,
-                rateLimitHits: metrics.rateLimitHits,
-                errorTypes: Object.fromEntries(metrics.errorTypes)
-            });
+            metrics[endpoint] = {
+                successRate,
+                avgLatency,
+                rateLimitHits: value.rateLimitHits,
+                lastError: value.lastError,
+                lastUsed: value.lastUsed
+            };
         });
+
+        return metrics;
     }
 
     async trackEndpointMetrics(endpoint, startTime, success) {
@@ -395,26 +410,37 @@ class TokenMonitor {
         if (this.isProcessingQueue) return;
         
         this.isProcessingQueue = true;
-        const BATCH_SIZE = 3; // Process 3 requests at a time
-        const BATCH_INTERVAL = 5000; // 5 second interval between batches
+        const BATCH_SIZE = 2; // Reduced from 3 to 2
+        const BATCH_INTERVAL = 8000; // Increased from 5s to 8s
         
         try {
             while (this.priorityQueue.length || this.requestQueue.length) {
                 const batch = [];
                 
-                // Get batch of requests
+                // Prioritize high-priority requests
                 while (batch.length < BATCH_SIZE && (this.priorityQueue.length || this.requestQueue.length)) {
                     const request = this.priorityQueue.shift() || this.requestQueue.shift();
-                    batch.push(request);
+                    if (request && Date.now() - request.timestamp < 60000) { // Skip stale requests
+                        batch.push(request);
+                    }
                 }
                 
-                // Process batch concurrently
-                await Promise.all(batch.map(request => 
-                    this.executeWithCircuitBreaker(request.operation)
-                ));
-                
-                // Wait between batches
-                await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL));
+                if (batch.length > 0) {
+                    await Promise.all(batch.map(request => 
+                        this.executeWithCircuitBreaker(request.operation)
+                            .catch(error => {
+                                if (error.message.includes('429')) {
+                                    this.rotateConnection();
+                                    return new Promise(resolve => 
+                                        setTimeout(() => resolve(this.executeWithCircuitBreaker(request.operation)), 10000)
+                                    );
+                                }
+                                throw error;
+                            })
+                    ));
+                    
+                    await new Promise(resolve => setTimeout(resolve, BATCH_INTERVAL));
+                }
             }
         } finally {
             this.isProcessingQueue = false;
@@ -458,7 +484,7 @@ class TokenMonitor {
         const bestEndpoint = metrics[0].endpoint;
         if (bestEndpoint !== this.config.rpc.endpoints[this.currentRpcIndex]) {
             this.currentRpcIndex = endpoints.indexOf(bestEndpoint);
-            this.rotateEndpoint();
+            this.rotateConnection();
         }
     }
 
@@ -560,78 +586,12 @@ class TokenMonitor {
         });
     }
 
-    async adjustThresholds() {
-        const metrics = Array.from(this.endpointMetrics.values());
-        const averageLatency = metrics.reduce((sum, m) => sum + m.averageLatency, 0) / metrics.length;
-        const maxRateLimits = Math.max(...metrics.map(m => m.rateLimitHits));
-
-        // Adjust thresholds based on recent performance
-        this.alertThresholds.latencyMs = Math.max(
-            this.adaptiveThresholds.minThresholds.latencyMs,
-            averageLatency * (1 + this.adaptiveThresholds.adjustmentFactor)
-        );
-
-        this.alertThresholds.rateLimitHits = Math.max(
-            this.adaptiveThresholds.minThresholds.rateLimitHits,
-            maxRateLimits * (1 + this.adaptiveThresholds.adjustmentFactor)
-        );
-
-        console.log('Updated alert thresholds:', this.alertThresholds);
-    }
-
-    updateWalletActivity(wallet, activityType, value = 1) {
-        if (!this.walletActivityMetrics.has(wallet)) {
-            this.walletActivityMetrics.set(wallet, {
-                score: 0,
-                activities: [],
-                lastActive: 0,
-                purchasePatterns: new Map()
-            });
-        }
-
-        const metrics = this.walletActivityMetrics.get(wallet);
-        const weight = this.ACTIVITY_WEIGHTS[activityType] || 1.0;
-        
-        metrics.score = metrics.score * 0.95 + (value * weight); // Decay old score by 5%
-        metrics.activities.unshift({ type: activityType, timestamp: Date.now() });
-        metrics.activities = metrics.activities.slice(0, 100); // Keep last 100 activities
-        metrics.lastActive = Date.now();
-
-        // Update purchase patterns for memecoin purchases
-        if (activityType === 'memecoinPurchase') {
-            const hour = Math.floor(Date.now() / 3600000);
-            metrics.purchasePatterns.set(hour, (metrics.purchasePatterns.get(hour) || 0) + 1);
-        }
-    }
-
-    predictEndpointPerformance(endpoint) {
-        const metrics = this.endpointMetrics.get(endpoint);
-        if (!metrics) return 0;
-
-        const recentLatencies = metrics.performance.last5m;
-        if (recentLatencies.length < 5) return 0;
-
-        // Calculate trend
-        const trend = recentLatencies.slice(-5).reduce((acc, curr, idx, arr) => {
-            if (idx === 0) return 0;
-            return acc + (curr - arr[idx - 1]);
-        }, 0) / 4;
-
-        // Calculate reliability score
-        const successRate = metrics.successCount / (metrics.successCount + metrics.failureCount);
-        const latencyScore = 1 - (metrics.averageLatency / 2000); // Normalize to 0-1
-        const rateLimitScore = 1 - (metrics.rateLimitHits / 10);
-
-        // Weighted scoring
-        return (successRate * 0.4) + (latencyScore * 0.3) + (rateLimitScore * 0.2) + (trend * 0.1);
-    }
-
     async trainPredictionModel() {
         const metrics = Array.from(this.endpointMetrics.entries());
         
         for (const [endpoint, metrics] of metrics) {
             // Add historical data points
-            metrics.performance.last15m.forEach((latency, index) => {
+            metrics.performance.last5m.forEach((latency, index) => {
                 const historicalMetrics = {
                     ...metrics,
                     averageLatency: latency,
@@ -662,51 +622,53 @@ class TokenMonitor {
                             (a.currentScore * (1 - a.prediction.failureProbability)))[0];
         
         if (bestEndpoint.endpoint !== this.config.rpc.endpoints[this.currentRpcIndex]) {
-            this.rotateEndpoint();
+            this.rotateConnection();
         }
     }
 
-    async analyzeWalletPatterns() {
-        const wallets = Array.from(this.walletActivityMetrics.keys());
-        const now = Date.now();
+    calculateAdaptiveDelay() {
+        const baseDelay = 2000; // 2 seconds base delay
+        const rateLimitMultiplier = this.endpointMetrics.get(this.connection._rpcEndpoint)?.rateLimitHits || 0;
+        
+        // Increase delay if we're hitting rate limits
+        const adaptiveDelay = baseDelay * (1 + (rateLimitMultiplier * 0.5));
+        
+        // Cap maximum delay at 10 seconds
+        return Math.min(adaptiveDelay, 10000);
+    }
 
-        for (const wallet of wallets) {
-            const metrics = this.walletActivityMetrics.get(wallet);
+    async executeRequest(operation, priority = false) {
+        const endpoint = await this.selectBestEndpoint();
+        const metrics = this.endpointMetrics.get(endpoint);
+        const startTime = Date.now();
+
+        try {
+            // Get rate limit token
+            await this.walletTracker.rateLimiter.getToken();
             
-            // Clean up old activities
-            metrics.activities = metrics.activities.filter(
-                activity => now - activity.timestamp < this.walletBehaviorAnalyzer.ANALYSIS_WINDOW
-            );
+            // Execute with timeout
+            const result = await Promise.race([
+                operation(this.connection),
+                new Promise((_, reject) => 
+                    setTimeout(() => reject(new Error('Request timeout')), 30000)
+                )
+            ]);
 
-            // Analyze patterns if we have enough data
-            if (metrics.activities.length > 0) {
-                const purchasePattern = {
-                    purchases: metrics.activities.filter(a => a.type === 'memecoinPurchase'),
-                    timePatterns: metrics.purchasePatterns,
-                    score: metrics.score
-                };
+            // Update metrics
+            this.updateEndpointMetrics(endpoint, {
+                latency: Date.now() - startTime,
+                success: true
+            });
 
-                this.walletBehaviorAnalyzer.analyzePurchasePattern(wallet, purchasePattern);
-                
-                // Update priority based on analysis
-                const relatedWallets = this.walletBehaviorAnalyzer.findRelatedWallets(wallet);
-                if (relatedWallets.length > 0) {
-                    this.adjustWalletPriority(wallet, relatedWallets);
-                }
+            return result;
+        } catch (error) {
+            if (error.message.includes('429')) {
+                metrics.rateLimitHits++;
+                this.setCooldown(endpoint);
+                await this.rotateConnection();
+                return this.executeRequest(operation, priority);
             }
-        }
-    }
-
-    adjustWalletPriority(wallet, relatedWallets) {
-        const metrics = this.walletActivityMetrics.get(wallet);
-        const relatedActivity = relatedWallets.some(related => {
-            const relatedMetrics = this.walletActivityMetrics.get(related);
-            return relatedMetrics && relatedMetrics.score > 0.7;
-        });
-
-        if (relatedActivity) {
-            metrics.score *= 1.2; // Boost priority
-            console.log(`Boosted priority for wallet ${wallet.slice(0, 4)}... due to related wallet activity`);
+            throw error;
         }
     }
 }

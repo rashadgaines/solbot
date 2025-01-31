@@ -5,6 +5,9 @@ class EmergencyHandler extends EventEmitter {
         super();
         this.dashboard = dashboard;
         this.telegramHandler = telegram;
+        this.errorCounts = new Map();
+        this.ERROR_THRESHOLD = 3;
+        this.RESET_INTERVAL = 300000; // 5 minutes
         
         if (this.dashboard?.io) {
             this.dashboard.io.on('emergency-stop', () => this.triggerEmergencyStop());
@@ -39,6 +42,29 @@ class EmergencyHandler extends EventEmitter {
             console.error('Emergency stop failed:', error);
             throw error;
         }
+    }
+
+    handleError(error, context) {
+        console.error(`Error in ${context}:`, error);
+        
+        // Track error count
+        const currentCount = this.errorCounts.get(context) || 0;
+        this.errorCounts.set(context, currentCount + 1);
+
+        // Reset error count after interval
+        setTimeout(() => {
+            this.errorCounts.set(context, 0);
+        }, this.RESET_INTERVAL);
+
+        // Check if we need to take emergency action
+        if (this.errorCounts.get(context) >= this.ERROR_THRESHOLD) {
+            this.handleEmergency(context);
+        }
+    }
+
+    handleEmergency(context) {
+        console.error(`Emergency: Multiple errors detected in ${context}`);
+        // Add any emergency handling logic here
     }
 }
 

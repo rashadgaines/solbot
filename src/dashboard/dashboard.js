@@ -3,71 +3,35 @@ const http = require('http');
 const cors = require('cors');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const socketIo = require('socket.io');
-const AnalyticsView = require('./analytics-view');
 
 class Dashboard {
     constructor(config, bot) {
         this.config = config;
         this.bot = bot;
-        
-        // Use bot's wallet address if config doesn't provide one
-        const walletAddress = config.wallet?.address || bot.config.wallet.address;
-        
-        if (!walletAddress) {
-            throw new Error('No wallet address provided in configuration');
-        }
-        
-        try {
-            this.walletAddress = new PublicKey(walletAddress);
-        } catch (error) {
-            throw new Error(`Invalid wallet address: ${walletAddress}`);
-        }
-        
+        this.walletAddress = config.wallet.address;
+        this.walletPublicKey = new PublicKey(this.walletAddress);
+        this.connection = bot.connection;
+        this.lastMetrics = null;
         this.connectedClients = new Set();
-        this.lastRequestTime = 0;
-        this.requestQueue = [];
-        this.retryDelay = 500;
-        this.maxRetryDelay = 8000;
-        
-        // Create a new connection with proper version support
-        this.connection = new Connection(bot.connection.rpcEndpoint, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0
-        });
         
         // Initialize Express server
-        const app = express();
-        app.use(express.static(__dirname + '/public'));
-        app.use(cors());
+        this.app = express();
+        this.app.use(cors());
+        this.server = http.createServer(this.app);
+        this.io = socketIo(this.server);
         
-        this.server = http.createServer(app);
-        this.io = socketIo(this.server, {
-            cors: {
-                origin: "*",
-                methods: ["GET", "POST"]
-            }
-        });
-        
-        this.initializeRoutes(app);
-        this.initializeSocketEvents();
-        this.server.listen(config.dashboard.port);
-        
-        console.log(`Dashboard server started on port ${config.dashboard.port}`);
-        this.startMetricsLoop();
-
-        this.analyticsView = new AnalyticsView(this);
-        this.metricsBuffer = new Map();
-        this.METRICS_BUFFER_SIZE = 100;
+        this.setupSocketHandlers();
+        this.startMetricsInterval();
     }
 
-    initializeRoutes(app) {
+    setupSocketHandlers() {
         // Health check endpoint
-        app.get('/health', (req, res) => {
+        this.app.get('/health', (req, res) => {
             res.json({ status: 'ok' });
         });
 
         // Get current metrics
-        app.get('/api/metrics', async (req, res) => {
+        this.app.get('/api/metrics', async (req, res) => {
             try {
                 const metrics = await this.gatherMetrics();
                 res.json(metrics);
@@ -77,27 +41,7 @@ class Dashboard {
         });
     }
 
-    initializeSocketEvents() {
-        this.io.on('connection', (socket) => {
-            const clientId = socket.id;
-            this.connectedClients.add(clientId);
-            console.log(`Client connected (${clientId}). Total clients: ${this.connectedClients.size}`);
-            
-            // Send initial metrics
-            this.updateMetrics();
-            
-            socket.on('disconnect', () => {
-                this.connectedClients.delete(clientId);
-                console.log(`Client disconnected (${clientId}). Total clients: ${this.connectedClients.size}`);
-            });
-
-            socket.on('error', (error) => {
-                console.error(`Socket error for client ${clientId}:`, error);
-            });
-        });
-    }
-
-    startMetricsLoop() {
+    startMetricsInterval() {
         setInterval(async () => {
             if (this.connectedClients.size > 0) {
                 await this.updateMetrics();
@@ -107,8 +51,9 @@ class Dashboard {
 
     async updateMetrics() {
         try {
-            const metrics = await this.gatherMetrics();
-            this.io.emit('metrics-update', metrics);
+            const metrics = await this.getBaseMetrics();
+            console.log('Emitting metrics:', metrics); // Debug log
+            this.io.emit('metrics', metrics);
         } catch (error) {
             console.error('Error updating metrics:', error);
         }
@@ -203,6 +148,16 @@ class Dashboard {
             .slice(0, 5); // Top 5 patterns
     }
 
+    getWalletMetrics() {
+        return {
+            address: this.walletAddress ? 
+                this.walletAddress.slice(0, 4) + '...' + this.walletAddress.slice(-4) : 
+                'Not configured',
+            balance: this.lastMetrics?.balance || { sol: 0, usd: 0 },
+            lastUpdate: new Date().toISOString()
+        };
+    }
+
     async retryWithBackoff(fn) {
         while (true) {
             try {
@@ -220,16 +175,36 @@ class Dashboard {
     }
 
     async getBaseMetrics() {
-        const walletBalance = await this.connection.getBalance(this.walletAddress);
-        
-        return {
-            balance: {
-                sol: walletBalance / 1e9,
-                usd: (walletBalance / 1e9) * (await this.bot.walletTracker.getSolPrice())
-            },
-            connections: this.connectedClients.size,
-            uptime: process.uptime()
-        };
+        try {
+            if (!this.walletAddress) {
+                console.error('No wallet address configured');
+                return {
+                    balance: { sol: 0, usd: 0 },
+                    connections: this.connectedClients.size,
+                    uptime: process.uptime()
+                };
+            }
+
+            console.log('Fetching balance for wallet:', this.walletAddress);
+            const walletBalance = await this.connection.getBalance(this.walletPublicKey);
+            const solPrice = await this.bot.walletTracker.getSolPrice();
+            
+            const metrics = {
+                balance: {
+                    sol: walletBalance / 1e9,
+                    usd: (walletBalance / 1e9) * solPrice
+                },
+                connections: this.connectedClients.size,
+                uptime: process.uptime()
+            };
+            
+            this.lastMetrics = metrics;
+            console.log('Dashboard metrics:', metrics);
+            return metrics;
+        } catch (error) {
+            console.error('Error getting base metrics:', error);
+            throw error;
+        }
     }
 }
 
