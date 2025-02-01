@@ -169,8 +169,7 @@ class WalletTracker extends EventEmitter {
             this.getRecentSignatures(wallet)
         ]);
 
-        const transactions = await this.processTransactions(signatures);
-        // Wait for all promises to resolve
+        const transactions = await this.processTransactions(signatures, wallet);
         const memecoinTxs = await Promise.all(
             transactions
                 .map(tx => this.extractMemecoinTransaction(tx, wallet))
@@ -179,7 +178,7 @@ class WalletTracker extends EventEmitter {
 
         return {
             hasActivity: memecoinTxs.length > 0,
-            memecoinTransactions: memecoinTxs.filter(tx => tx !== null) // Additional null check
+            memecoinTransactions: memecoinTxs.filter(tx => tx !== null)
         };
     }
 
@@ -200,7 +199,7 @@ class WalletTracker extends EventEmitter {
         return signatures.filter(sig => sig.blockTime && sig.blockTime > cutoffTime);
     }
 
-    async processTransactions(signatures) {
+    async processTransactions(signatures, wallet) {
         const transactions = [];
         
         if (signatures.length > 0) {
@@ -219,9 +218,15 @@ class WalletTracker extends EventEmitter {
                 );
                 
                 if (tx && tx.transaction) {
-                    const memecoinTx = await this.extractMemecoinTransaction(tx, sig.wallet);
+                    const memecoinTx = await this.extractMemecoinTransaction(tx, wallet);
                     if (memecoinTx) {
                         Logger.success(`Found new memecoin transaction: ${sig.signature}`);
+                        // Emit the event with the correct wallet address
+                        this.emit('walletUpdate', {
+                            wallet,
+                            memecoinTransactions: [memecoinTx],
+                            timestamp: Date.now()
+                        });
                         transactions.push(memecoinTx);
                     }
                 }
@@ -268,7 +273,7 @@ class WalletTracker extends EventEmitter {
             this.sentAlerts.set(txSignature, Date.now());
 
             return {
-                wallet,
+                walletAddress: wallet,
                 tokenAddress: instruction.parsed.info.mint,
                 amount: instruction.parsed.info.amount / 1e9,
                 timestamp: tx.blockTime * 1000,
@@ -295,6 +300,31 @@ class WalletTracker extends EventEmitter {
             return JSON.parse(data).wallets;
         } catch (error) {
             console.error('Error loading wallets:', error);
+            return [];
+        }
+    }
+
+    async getRecentTransactions(wallet, limit = 100) {
+        try {
+            const signatures = await this.connection.getSignaturesForAddress(
+                new PublicKey(wallet),
+                { limit }
+            );
+
+            const transactions = await Promise.all(
+                signatures.map(async (sig) => {
+                    const tx = await this.connection.getParsedTransaction(sig.signature);
+                    return {
+                        signature: sig.signature,
+                        success: tx?.meta?.err === null,
+                        timestamp: sig.blockTime * 1000
+                    };
+                })
+            );
+
+            return transactions;
+        } catch (error) {
+            console.error('Error fetching recent transactions:', error);
             return [];
         }
     }

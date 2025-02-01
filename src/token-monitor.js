@@ -1,6 +1,5 @@
 const { Connection, PublicKey } = require('@solana/web3.js');
 const TelegramBot = require('node-telegram-bot-api');
-const Dashboard = require('./dashboard/dashboard');
 const EmergencyHandler = require('./handlers/emergency-handler');
 const TelegramHandler = require('./handlers/telegram-handler');
 const WalletTracker = require('./wallet-tracker');
@@ -29,7 +28,6 @@ class TokenMonitor {
             this.walletTracker
         );
         
-        this.dashboard = this.initializeDashboard();
         this.initializeErrorHandler();
         Logger.success('All components initialized successfully');
         
@@ -38,29 +36,8 @@ class TokenMonitor {
             this.telegramHandler.sendWelcomeMessage();
         }
 
-        this.failureCount = new Map();
-        this.FAILURE_THRESHOLD = 3;
-        this.RESET_INTERVAL = 180000;
-
-        this.endpointMetrics = new Map();
+        // Initialize remaining properties
         this.initializeEndpointMetrics();
-
-        this.requestQueue = [];
-        this.priorityQueue = [];
-        this.isProcessingQueue = false;
-        this.queueProcessInterval = setInterval(() => this.processQueue(), 100);
-
-        this.endpointCooldowns = new Map();
-        this.COOLDOWN_DURATION = 60000; // 1 minute cooldown
-
-        this.alertThresholds = {
-            rateLimitHits: 3,
-            failureRate: 0.15,
-            latencyMs: 800,
-            consecutiveFailures: 2
-        };
-
-        this.endpointPredictor = new EndpointPredictor();
     }
 
     validateEndpoint(endpoint) {
@@ -167,19 +144,6 @@ class TokenMonitor {
         }
         
         return false;
-    }
-
-    initializeDashboard() {
-        this.dashboard = new Dashboard({
-            dashboard: {
-                port: process.env.DASHBOARD_PORT || 3000
-            },
-            wallet: {
-                address: process.env.WALLET_ADDRESS
-            }
-        }, this);
-        console.log('Dashboard initialized on port 3000');
-        return this.dashboard;
     }
 
     initializeErrorHandler() {

@@ -7,11 +7,6 @@ const config = {
         batchSize: 1,
         batchDelay: 8000                 
     },
-    dashboard: {
-        port: process.env.DASHBOARD_PORT || 3000,
-        updateInterval: 30000, // 30 seconds
-        maxHistoricalTransactions: 100
-    },
     rpc: {
         endpoints: [
             process.env.HELIUS_RPC_URL,

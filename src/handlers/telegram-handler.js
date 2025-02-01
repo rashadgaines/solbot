@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
+const Logger = require('../utils/logger');
 
 class TelegramHandler {
     constructor(bot, chatId, walletAddress, walletTracker) {
@@ -170,18 +171,20 @@ ${solBalance.toFixed(4)} SOL ($${usdBalance.toFixed(2)} USD)
     }
 
     async sendMemecoinAlert(update) {
+        if (!update.memecoinTransactions || update.memecoinTransactions.length === 0) {
+            return;
+        }
+
         for (const tx of update.memecoinTransactions) {
             if (!tx || !tx.tokenAddress) {
-                console.error('Invalid transaction data:', tx);
+                Logger.error('Invalid transaction data:', tx);
                 continue;
             }
 
             const message = `
-🚨 New Memecoin Purchase Detected! 🚨
+🚨 ALPHA: Wallet Activity 🚨
 
-👛 Wallet: ${tx.wallet.slice(0, 4)}...${tx.wallet.slice(-4)}
-🪙 Token: ${tx.tokenSymbol} (${tx.tokenName})
-💰 Amount: ${tx.amount.toFixed(2)} SOL
+👛 Wallet: ${update.wallet.slice(0, 4)}...${update.wallet.slice(-4)}
 ⏰ Time: ${new Date(tx.timestamp).toLocaleString()}
 
 📊 Links:
@@ -189,15 +192,17 @@ ${solBalance.toFixed(4)} SOL ($${usdBalance.toFixed(2)} USD)
 • Chart: https://dexscreener.com/solana/${tx.tokenAddress}
 • Transaction: https://solscan.io/tx/${tx.signature}
 
-⚠️ DYOR - Not financial advice`;
+By VLX Capital`;
 
             try {
+                Logger.info(`Sending Telegram alert for transaction: ${tx.signature}`);
                 await this.bot.sendMessage(this.chatId, message, {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 });
+                Logger.success(`Successfully sent Telegram alert for: ${tx.signature}`);
             } catch (error) {
-                console.error('Error sending Telegram alert:', error);
+                Logger.error(`Error sending Telegram alert: ${error.message}`);
             }
         }
     }
