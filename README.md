@@ -1,6 +1,6 @@
 # Solana Wallet Tracker
 
-A real-time monitoring system for tracking Solana wallet activities, specifically focused on memecoin transactions. Built with Node.js and Telegram integration.
+A real-time monitoring system for tracking Solana active "whale" wallet activities. Built with Node.js and Telegram integration.
 
 ## Features
 
