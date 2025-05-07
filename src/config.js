@@ -9,8 +9,8 @@ const config = {
     },
     rpc: {
         endpoints: [
-            process.env.HELIUS_RPC_URL,
-            process.env.QUICKNODE_RPC_URL
+            process.env.QUICKNODE_RPC_URL,
+            process.env.HELIUS_RPC_URL
         ].filter(Boolean),
         retryDelay: 8000,
         maxRetries: 2,
