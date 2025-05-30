@@ -42,4 +42,4 @@ class SimpleNeuralNetwork {
     }
 }
 
-module.exports = SimpleNeuralNetwork; 
+module.exports = SimpleNeuralNetwork;  

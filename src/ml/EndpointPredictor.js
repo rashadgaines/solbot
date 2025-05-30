@@ -51,4 +51,4 @@ class EndpointPredictor {
     }
 }
 
-module.exports = EndpointPredictor; 
+module.exports = EndpointPredictor;  

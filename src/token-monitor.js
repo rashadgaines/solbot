@@ -1,5 +1,5 @@
 const { Connection, PublicKey } = require('@solana/web3.js');
-const TelegramBot = require('node-telegram-bot-api');
+const { Telegraf } = require('telegraf');
 const EmergencyHandler = require('./handlers/emergency-handler');
 const TelegramHandler = require('./handlers/telegram-handler');
 const WalletTracker = require('./wallet-tracker');
@@ -15,16 +15,12 @@ class TokenMonitor {
         this.connection = this.createConnection();
         Logger.success(`Connected to RPC: ${this.config.rpc.endpoints[0]}`);
         
-        this.walletAddress = process.env.WALLET_ADDRESS;
-        Logger.info(`Main wallet address: ${this.walletAddress}`);
-        
         // Initialize components
         Logger.info('Initializing components...');
         this.walletTracker = new WalletTracker(this.connection, config.monitoring, this);
         this.telegramHandler = new TelegramHandler(
-            new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true }),
+            new Telegraf(process.env.TELEGRAM_BOT_TOKEN),
             process.env.TELEGRAM_CHAT_ID,
-            this.walletAddress,
             this.walletTracker
         );
         

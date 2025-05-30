@@ -1,86 +1,57 @@
-const TelegramBot = require('node-telegram-bot-api');
+const { Telegraf } = require('telegraf');
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 const Logger = require('../utils/logger');
 
 class TelegramHandler {
-    constructor(bot, chatId, walletAddress, walletTracker) {
+    constructor(bot, chatId, walletTracker) {
         this.bot = bot;
         this.chatId = chatId || process.env.TELEGRAM_CHAT_ID;
-        this.walletAddress = walletAddress || process.env.WALLET_ADDRESS;
         this.walletTracker = walletTracker;
         this.commandCooldowns = new Map();
         this.COOLDOWN_PERIOD = 5000; // 5 seconds between commands
         this.initializeCommands();
         this.initializeHandlers();
+        this.bot.launch();
     }
 
-    async handleCommand(chatId, command, handler) {
+    async handleCommand(ctx, command, handler) {
+        const chatId = ctx.chat.id;
         const cooldownKey = `${chatId}-${command}`;
         const lastUsed = this.commandCooldowns.get(cooldownKey) || 0;
         const now = Date.now();
 
         if (now - lastUsed < this.COOLDOWN_PERIOD) {
-            await this.bot.sendMessage(chatId, '⚠️ Please wait a few seconds between commands');
+            await ctx.reply('⚠️ Please wait a few seconds between commands');
             return;
         }
 
         try {
             this.commandCooldowns.set(cooldownKey, now);
-            await handler();
+            await handler(ctx);
         } catch (error) {
             console.error(`Command error (${command}):`, error);
-            await this.bot.sendMessage(chatId, '❌ Command failed. Please try again.');
+            await ctx.reply('❌ Command failed. Please try again.');
         }
     }
 
     initializeCommands() {
         // Help command
-        this.bot.onText(/\/help/, (msg) => {
-            this.handleCommand(msg.chat.id, 'help', () => this.sendHelp(msg.chat.id));
+        this.bot.command('help', (ctx) => {
+            this.handleCommand(ctx, 'help', () => this.sendHelp(ctx));
         });
 
         // Add wallet command with validation
-        this.bot.onText(/\/addwallet (.+)/, (msg, match) => {
-            this.handleCommand(msg.chat.id, 'addwallet', () => 
-                this.addWalletToTrack(msg.chat.id, match[1]));
+        this.bot.hears(/\/addwallet (.+)/, (ctx) => {
+            const match = ctx.message.text.match(/\/addwallet (.+)/);
+            if (match) {
+                this.handleCommand(ctx, 'addwallet', () => this.addWalletToTrack(ctx, match[1]));
+            }
         });
 
         // List tracked wallets
-        this.bot.onText(/\/wallets/, async (msg) => {
-            await this.listTrackedWallets(msg.chat.id);
-        });
-
-        // Wallet balance command
-        this.bot.onText(/\/balance/, async (msg) => {
-            await this.getWalletBalance(msg.chat.id);
-        });
-
-        // Quick buy command from alerts
-        this.bot.onText(/\/buy_(.+)_(.+)/, async (msg, match) => {
-            const token = match[1];
-            const amount = match[2];
-            await this.executeBuy(msg.chat.id, token, amount);
-        });
-
-        // Custom amount handler
-        this.bot.on('callback_query', async (query) => {
-            if (query.data.startsWith('buy_') && query.data.endsWith('_custom')) {
-                const token = query.data.split('_')[1];
-                await this.bot.sendMessage(query.message.chat.id, 
-                    '💰 Enter the amount of SOL to buy (e.g., 0.5):');
-                
-                // Set up one-time listener for the amount
-                this.bot.once('message', async (msg) => {
-                    const amount = parseFloat(msg.text);
-                    if (!isNaN(amount) && amount > 0) {
-                        await this.executeBuy(msg.chat.id, token, amount);
-                    } else {
-                        await this.bot.sendMessage(msg.chat.id, 
-                            '❌ Invalid amount. Please enter a valid number.');
-                    }
-                });
-            }
+        this.bot.command('wallets', (ctx) => {
+            this.listTrackedWallets(ctx);
         });
     }
 
@@ -92,7 +63,7 @@ class TelegramHandler {
         });
     }
 
-    async sendHelp(chatId) {
+    async sendHelp(ctx) {
         const helpMessage = `
 🤖 Welcome to Wallet Tracker Bot!
 
@@ -101,24 +72,20 @@ Available Commands:
 /addwallet [address] - Add wallet to track
 /wallets - List tracked wallets
 
-💰 Portfolio:
-/balance - Check your wallet balance
-
 ⚠️ Alerts will show:
 - Token purchases from tracked wallets
 - Purchase amounts and timing
-- Multiple wallet correlation
 
 Example:
 /addwallet FZLt2wfpE5cxkHkxGwsoPjt4TxAQPzwjBWyuJDVqMKyN
 `;
-        await this.bot.sendMessage(chatId, helpMessage);
+        await ctx.reply(helpMessage);
     }
 
-    async getWalletBalance(chatId) {
+    async getWalletBalance(ctx) {
         try {
             if (!this.walletAddress) {
-                await this.bot.sendMessage(chatId, '❌ No wallet address configured');
+                await ctx.reply('❌ No wallet address configured');
                 return;
             }
 
@@ -132,10 +99,10 @@ Example:
 ${solBalance.toFixed(4)} SOL ($${usdBalance.toFixed(2)} USD)
 🏦 Wallet: ${this.walletAddress.slice(0, 4)}...${this.walletAddress.slice(-4)}`;
 
-            await this.bot.sendMessage(chatId, message);
+            await ctx.reply(message);
         } catch (error) {
             console.error('Error fetching wallet balance:', error);
-            await this.bot.sendMessage(chatId, '❌ Error fetching wallet balance');
+            await ctx.reply('❌ Error fetching wallet balance');
         }
     }
 
@@ -149,24 +116,24 @@ ${solBalance.toFixed(4)} SOL ($${usdBalance.toFixed(2)} USD)
         }
     }
 
-    async addWalletToTrack(chatId, wallet) {
+    async addWalletToTrack(ctx, wallet) {
         try {
             await this.walletTracker.addWallet(wallet);
-            await this.bot.sendMessage(chatId, `✅ Wallet added to tracking: ${wallet}`);
+            await ctx.reply(`✅ Wallet added to tracking: ${wallet}`);
         } catch (error) {
-            await this.bot.sendMessage(chatId, `❌ Failed to add wallet: ${error.message}`);
+            await ctx.reply(`❌ Failed to add wallet: ${error.message}`);
         }
     }
 
-    async listTrackedWallets(chatId) {
+    async listTrackedWallets(ctx) {
         try {
             const wallets = this.walletTracker.trackedWallets;
             const message = wallets.length > 0 
                 ? `📋 Tracked Wallets:\n${wallets.join('\n')}`
                 : '📋 No wallets currently tracked';
-            await this.bot.sendMessage(chatId, message);
+            await ctx.reply(message);
         } catch (error) {
-            await this.bot.sendMessage(chatId, '❌ Failed to list wallets');
+            await ctx.reply('❌ Failed to list wallets');
         }
     }
 
@@ -196,7 +163,7 @@ By VLX Capital`;
 
             try {
                 Logger.info(`Sending Telegram alert for transaction: ${tx.signature}`);
-                await this.bot.sendMessage(this.chatId, message, {
+                await this.bot.telegram.sendMessage(this.chatId, message, {
                     parse_mode: 'HTML',
                     disable_web_page_preview: true
                 });
@@ -213,7 +180,7 @@ By VLX Capital`;
 
 Monitoring ${this.walletTracker.trackedWallets.length} wallets for memecoin activity.
 `;
-        await this.bot.sendMessage(this.chatId, message);
+        await this.bot.telegram.sendMessage(this.chatId, message);
     }
 
     async sendTokenAlert(alert) {
@@ -247,7 +214,7 @@ ${alert.url ? `• Transaction: ${alert.url}` : ''}
                 );
             }
 
-            await this.bot.sendMessage(this.chatId, message, {
+            await this.bot.telegram.sendMessage(this.chatId, message, {
                 parse_mode: 'HTML',
                 reply_markup: inlineKeyboard
             });
